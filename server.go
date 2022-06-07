@@ -13,7 +13,6 @@ import (
     "errors"
     "io"
     "net"
-    // "strings"
     "sync"
     "syscall"
     "time"
@@ -23,36 +22,7 @@ import (
     "github.com/miekg/dns"
 
     "github.com/lucas-clemente/quic-go"
-    // For enabling QUIC connection tracing:
-    // "github.com/lucas-clemente/quic-go/logging"
-    // "github.com/lucas-clemente/quic-go/qlog"
-    // "os"
 )
-
-// aLongTimeAgo is a non-zero time, far in the past, used for
-// immediate cancelation of network operations.
-var aLongTimeAgo = time.Unix(1, 0)
-
-type connection struct {
-    lock    sync.RWMutex
-    conn    quic.Connection
-    streams map[quic.Stream]struct{}
-    wg      sync.WaitGroup
-}
-
-type response struct {
-    closed         bool // connection has been closed
-    hijacked       bool // connection has been hijacked by handler
-    tsigTimersOnly bool
-    tsigStatus     error
-    // TODO:
-    // tsigRequestMAC string
-    // tsigProvider   dns.TsigProvider
-    doq        quic.Stream // i/o connection if QUIC was used
-    writer     dns.Writer  // writer to output the raw DNS bits
-    localAddr  net.Addr
-    remoteAddr net.Addr
-}
 
 // Reader reads raw DNS messages; each call to ReadQUIC should return an entire message.
 type Reader interface {
@@ -71,8 +41,12 @@ type Server struct {
     Addr string
     // Set to "doq" for DNS-over-QUIC (RFC9250)
     Net string
+    // QUIC connection configuration
+    QuicConfig *quic.Config
     // QUIC Listener to use, this is to aid in systemd's socket activation.
     Listener quic.Listener
+    // Packet "Listener" to use, this is to aid in systemd's socket activation.
+    PacketConn net.PacketConn
     // TLS connection configuration
     TLSConfig *tls.Config
     // Handler to invoke, dns.DefaultServeMux if nil.
@@ -83,11 +57,10 @@ type Server struct {
     WriteTimeout time.Duration
     // TCP idle timeout for multiple queries, if nil, defaults to 8 * time.Second (RFC 5966).
     IdleTimeout func() time.Duration
-    // TODO:
-    // // An implementation of the dns.TsigProvider interface. If defined it replaces TsigSecret and is used for all TSIG operations.
-    // TsigProvider dns.TsigProvider
-    // // Secret(s) for Tsig map[<zonename>]<base64 secret>. The zonename must be in canonical form (lowercase, fqdn, see RFC 4034 Section 6.2).
-    // TsigSecret map[string]string
+    // An implementation of the TsigProvider interface. If defined it replaces TsigSecret and is used for all TSIG operations.
+    TsigProvider dns.TsigProvider
+    // Secret(s) for Tsig map[<zonename>]<base64 secret>. The zonename must be in canonical form (lowercase, fqdn, see RFC 4034 Section 6.2).
+    TsigSecret map[string]string
     // If NotifyStartedFunc is set it is called once the server has started listening.
     NotifyStartedFunc func()
     // DecorateReader is optional, allows customization of the process that reads raw DNS messages.
@@ -107,17 +80,6 @@ type Server struct {
     shutdown chan struct{}
     conns    map[*connection]struct{}
 }
-
-// TODO:
-// func (srv *Server) tsigProvider() dns.TsigProvider {
-//     if srv.TsigProvider != nil {
-//         return srv.TsigProvider
-//     }
-//     if srv.TsigSecret != nil {
-//         return tsigSecretProvider(srv.TsigSecret)
-//     }
-//     return nil
-// }
 
 func (srv *Server) init() {
     srv.shutdown = make(chan struct{})
@@ -144,6 +106,8 @@ func unlockOnce(l sync.Locker) func() {
 }
 
 // ListenAndServe starts a nameserver on the configured address in *Server.
+//
+// This will overwrite Listener and PacketConn.
 func (srv *Server) ListenAndServe() error {
     unlock := unlockOnce(&srv.lock)
     srv.lock.Lock()
@@ -184,19 +148,7 @@ func (srv *Server) ListenAndServe() error {
     if err != nil {
         return err
     }
-    // TODO: Why is this used?
-    // u := l.(*net.UDPConn)
-    // if e := setUDPSocketOptions(u); e != nil {
-    //     u.Close()
-    //     return e
-    // }
-    ql, err := quic.Listen(l, srv.TLSConfig, nil)
-    // For enabling QUIC connection tracing:
-    // &quic.Config{
-    //     Tracer: qlog.NewTracer(func(_ logging.Perspective, connID []byte) io.WriteCloser {
-    //         return io.WriteCloser(os.Stdout)
-    //     }),
-    // })
+    ql, err := quic.Listen(l, srv.TLSConfig, srv.QuicConfig)
     if err != nil {
         l.Close()
         return err
@@ -209,37 +161,48 @@ func (srv *Server) ListenAndServe() error {
 
 // ActivateAndServe starts a nameserver with the PacketConn or Listener
 // configured in *Server. Its main use is to start a server from systemd.
+//
+// It will first check if Listener can be used, otherwise it will use
+// PacketConn to create a quic.Listener and set Listener.
 func (srv *Server) ActivateAndServe() error {
-    // unlock := unlockOnce(&srv.lock)
-    // srv.lock.Lock()
-    // defer unlock()
-    //
-    // if srv.started {
-    //     return &Error{err: "server already started"}
-    // }
-    //
-    // srv.init()
-    //
-    // if srv.PacketConn != nil {
-    //     // Check PacketConn interface's type is valid and value
-    //     // is not nil
-    //     if t, ok := srv.PacketConn.(*net.UDPConn); ok && t != nil {
-    //         if e := setUDPSocketOptions(t); e != nil {
-    //             return e
-    //         }
-    //     }
-    //     srv.started = true
-    //     unlock()
-    //     return srv.serveUDP(srv.PacketConn)
-    // }
-    // if srv.Listener != nil {
-    //     srv.started = true
-    //     unlock()
-    //     return srv.serveTCP(srv.Listener)
-    // }
-    // return &Error{err: "bad listeners"}
+    unlock := unlockOnce(&srv.lock)
+    srv.lock.Lock()
+    defer unlock()
 
-    return errors.New("TODO")
+    if srv.started {
+        return errors.New("doq: server already started")
+    }
+
+    srv.init()
+
+    if srv.Listener != nil {
+        srv.started = true
+        unlock()
+        return srv.serveQUIC(srv.Listener)
+    }
+    if srv.PacketConn != nil {
+        // Check PacketConn interface's type is valid and value
+        // is not nil
+        if t, ok := srv.PacketConn.(*net.UDPConn); ok && t == nil {
+            return errors.New("doq: PacketConn is not a UDP connection")
+        }
+
+        if srv.TLSConfig == nil || (len(srv.TLSConfig.Certificates) == 0 && srv.TLSConfig.GetCertificate == nil) {
+            return errors.New("doq: neither Certificates nor GetCertificate set in Config")
+        }
+        srv.TLSConfig.NextProtos = []string{"doq", "doq-i03"}
+
+        ql, err := quic.Listen(srv.PacketConn, srv.TLSConfig, srv.QuicConfig)
+        if err != nil {
+            return err
+        }
+        srv.Listener = ql
+        srv.started = true
+        unlock()
+        return srv.serveQUIC(ql)
+    }
+
+    return errors.New("doq: neither Listener nor PacketConn was set")
 }
 
 // Shutdown shuts down a server. After a call to Shutdown, ListenAndServe and
@@ -267,9 +230,10 @@ func (srv *Server) ShutdownContext(ctx context.Context) error {
     }
 
     for rw := range srv.conns {
-        // rw.SetReadDeadline(aLongTimeAgo) // Unblock reads
-        // Close QUIC connections because above deadline only affects streams within the connection
+        rw.lock.Lock()
+        rw.closed = true
         rw.conn.CloseWithError(0, "")
+        rw.lock.Unlock()
     }
 
     srv.lock.Unlock()
@@ -327,17 +291,45 @@ func (srv *Server) serveDNS(m []byte, w *response) {
         return
     }
 
-    // TODO:
-    // w.tsigStatus = nil
-    // if w.tsigProvider != nil {
-    //     if t := req.IsTsig(); t != nil {
-    //         w.tsigStatus = tsigVerifyProvider(m, w.tsigProvider, "", false)
-    //         w.tsigTimersOnly = false
-    //         w.tsigRequestMAC = t.MAC
-    //     }
-    // }
+    w.tsigStatus = nil
+    if w.tsigProvider != nil {
+        if t := req.IsTsig(); t != nil {
+            w.tsigStatus = dns.TsigVerifyProvider(m, w.tsigProvider, "", false)
+            w.tsigTimersOnly = false
+            w.tsigRequestMAC = t.MAC
+        }
+    } else if w.tsigSecret != nil {
+        if t := req.IsTsig(); t != nil {
+            tsig := req.Extra[len(req.Extra)-1].(*dns.TSIG)
+            key, ok := w.tsigSecret[tsig.Hdr.Name]
+            if ok {
+                w.tsigStatus = dns.TsigVerify(m, key, "", false)
+            } else {
+                w.tsigStatus = dns.ErrSecret
+            }
+            w.tsigTimersOnly = false
+            w.tsigRequestMAC = t.MAC
+        }
+    }
 
     srv.Handler.ServeDNS(w, req) // Writes back to the client
+}
+
+// Response struct for ResponseWriter interface
+type response struct {
+    closed         bool // connection has been closed
+    hijacked       bool // connection has been hijacked by handler
+    tsigTimersOnly bool
+    tsigStatus     error
+    tsigRequestMAC string
+    tsigProvider   dns.TsigProvider
+    tsigSecret     map[string]string
+    doq            quic.Stream // i/o connection if QUIC was used
+    writer         dns.Writer  // writer to output the raw DNS bits
+    localAddr      net.Addr
+    remoteAddr     net.Addr
+
+    connectionState tls.ConnectionState
 }
 
 // WriteMsg implements the ResponseWriter.WriteMsg method.
@@ -347,17 +339,30 @@ func (w *response) WriteMsg(m *dns.Msg) (err error) {
     }
 
     var data []byte
-    // TODO:
-    // if w.tsigProvider != nil { // if no provider, dont check for the tsig (which is a longer check)
-    //     if t := m.IsTsig(); t != nil {
-    //         data, w.tsigRequestMAC, err = tsigGenerateProvider(m, w.tsigProvider, w.tsigRequestMAC, w.tsigTimersOnly)
-    //         if err != nil {
-    //             return err
-    //         }
-    //         _, err = w.writer.Write(data)
-    //         return err
-    //     }
-    // }
+    if w.tsigProvider != nil { // if no provider, dont check for the tsig (which is a longer check)
+        if t := m.IsTsig(); t != nil {
+            data, w.tsigRequestMAC, err = dns.TsigGenerateProvider(m, w.tsigProvider, w.tsigRequestMAC, w.tsigTimersOnly)
+            if err != nil {
+                return err
+            }
+            _, err = w.writer.Write(data)
+            return err
+        }
+    } else if w.tsigSecret != nil {
+        if t := m.IsTsig(); t != nil {
+            tsig := m.Extra[len(m.Extra)-1].(*dns.TSIG)
+            key, ok := w.tsigSecret[tsig.Hdr.Name]
+            if !ok {
+                return dns.ErrSecret
+            }
+            data, w.tsigRequestMAC, err = dns.TsigGenerate(m, key, w.tsigRequestMAC, w.tsigTimersOnly)
+            if err != nil {
+                return err
+            }
+            _, err = w.writer.Write(data)
+            return err
+        }
+    }
     data, err = m.Pack()
     if err != nil {
         return err
@@ -407,58 +412,19 @@ func (w *response) Close() error {
     return w.doq.Close()
 }
 
-// ConnectionState() implements the ConnectionStater.ConnectionState() interface.
+// ConnectionState() implements the dns.ConnectionStater interface
 func (w *response) ConnectionState() *tls.ConnectionState {
-    // TODO:
-    // type tlsConnectionStater interface {
-    //     ConnectionState() tls.ConnectionState
-    // }
-    // if v, ok := w.tcp.(tlsConnectionStater); ok {
-    //     t := v.ConnectionState()
-    //     return &t
-    // }
-    return nil
+    return &w.connectionState
 }
 
-// func (c *quicConn) Read(b []byte) (int, error) {
-//     panic("not supported")
-// }
-// func (c *quicConn) Write(b []byte) (int, error) {
-//     panic("not supported")
-// }
-// func (c *quicConn) Close() error {
-//     return c.conn.CloseWithError(0, "")
-// }
-// func (c *quicConn) LocalAddr() net.Addr {
-//     return c.conn.LocalAddr()
-// }
-// func (c *quicConn) RemoteAddr() net.Addr {
-//     return c.conn.RemoteAddr()
-// }
-// func (c *quicConn) SetDeadline(t time.Time) error {
-//     c.lock.Lock()
-//     for s := range c.streams {
-//         s.SetDeadline(t)
-//     }
-//     c.lock.Unlock()
-//     return nil
-// }
-// func (c *quicConn) SetReadDeadline(t time.Time) error {
-//     c.lock.Lock()
-//     for s := range c.streams {
-//         s.SetReadDeadline(t)
-//     }
-//     c.lock.Unlock()
-//     return nil
-// }
-// func (c *quicConn) SetWriteDeadline(t time.Time) error {
-//     c.lock.Lock()
-//     for s := range c.streams {
-//         s.SetWriteDeadline(t)
-//     }
-//     c.lock.Unlock()
-//     return nil
-// }
+// A quic connection
+type connection struct {
+    lock    sync.RWMutex
+    conn    quic.Connection
+    closed  bool
+    streams map[quic.Stream]struct{}
+    wg      sync.WaitGroup
+}
 
 // serveQUIC
 func (srv *Server) serveQUIC(l quic.Listener) error {
@@ -476,17 +442,16 @@ func (srv *Server) serveQUIC(l quic.Listener) error {
 
     for {
         conn, err := l.Accept(context.Background())
-        srv.lock.Lock()
         if err != nil {
-            // TODO: Use?
-            // if neterr, ok := err.(net.Error); ok && neterr.Temporary() {
-            //     continue
-            // }
-            srv.lock.Unlock()
+            if neterr, ok := err.(net.Error); ok && neterr.Temporary() {
+                continue
+            }
             return err
         }
+        srv.lock.Lock()
         if !srv.started {
             srv.lock.Unlock()
+            conn.CloseWithError(0, "")
             return nil
         }
         // Track the connection to allow unblocking reads on shutdown.
@@ -504,10 +469,16 @@ func (srv *Server) serveQUICConn(wg *sync.WaitGroup, c *connection) {
     for {
         stream, err := c.conn.AcceptStream(context.Background())
         if err != nil {
-            // TODO: What to do with err here? Close conn?
+            if neterr, ok := err.(net.Error); ok && neterr.Temporary() {
+                continue
+            }
             break
         }
         c.lock.Lock()
+        if c.closed {
+            c.lock.Unlock()
+            break
+        }
         // Track the stream to allow unblocking reads on shutdown.
         c.streams[stream] = struct{}{}
         c.lock.Unlock()
@@ -520,6 +491,8 @@ func (srv *Server) serveQUICConn(wg *sync.WaitGroup, c *connection) {
     srv.lock.Lock()
     delete(srv.conns, c)
     srv.lock.Unlock()
+
+    c.conn.CloseWithError(0, "")
 
     wg.Done()
 }
@@ -542,6 +515,10 @@ func (srv *Server) serveQUICStream(c *connection, stream quic.Stream) {
         doq:        stream,
         localAddr:  c.conn.LocalAddr(),
         remoteAddr: c.conn.RemoteAddr(),
+
+        tsigSecret: srv.TsigSecret,
+
+        connectionState: c.conn.ConnectionState().TLS.ConnectionState,
     }
     if srv.DecorateWriter != nil {
         w.writer = srv.DecorateWriter(w)
@@ -555,27 +532,18 @@ func (srv *Server) serveQUICStream(c *connection, stream quic.Stream) {
     }
 
     m, err := reader.ReadQUIC(stream, srv.ReadTimeout)
-    if err != nil {
-        // TODO: what to do here?
-        return
+    if err == nil {
+        srv.serveDNS(m, w)
     }
-    srv.serveDNS(m, w)
     if !w.hijacked {
         w.Close()
     }
 }
 
+// Default Reader.ReadQUIC() implementation
 func (srv *Server) ReadQUIC(stream quic.Stream, timeout time.Duration) ([]byte, error) {
-    // Copied from readTCP():
-    // If we race with ShutdownContext, the read deadline may
-    // have been set in the distant past to unblock the read
-    // below. We must not override it, otherwise we may block
-    // ShutdownContext.
-    srv.lock.RLock()
-    if srv.started {
-        stream.SetReadDeadline(time.Now().Add(timeout))
-    }
-    srv.lock.RUnlock()
+    // TODO: Do we need to read lock srv for this?
+    stream.SetReadDeadline(time.Now().Add(timeout))
 
     var length uint16
     if err := binary.Read(stream, binary.BigEndian, &length); err != nil {
