@@ -4,7 +4,7 @@ go 1.18
 
 require (
 	github.com/lucas-clemente/quic-go v0.27.1
-	github.com/miekg/dns v1.1.49
+	github.com/miekg/dns v1.1.50
 	golang.org/x/sys v0.0.0-20210630005230-0f9fa26af87c
 )
 
