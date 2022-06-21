@@ -294,7 +294,7 @@ func (srv *Server) serveDNS(m []byte, w *response) {
     w.tsigStatus = nil
     if w.tsigProvider != nil {
         if t := req.IsTsig(); t != nil {
-            w.tsigStatus = dns.TsigVerifyProvider(m, w.tsigProvider, "", false)
+            w.tsigStatus = dns.TsigVerifyWithProvider(m, w.tsigProvider, "", false)
             w.tsigTimersOnly = false
             w.tsigRequestMAC = t.MAC
         }
@@ -341,7 +341,7 @@ func (w *response) WriteMsg(m *dns.Msg) (err error) {
     var data []byte
     if w.tsigProvider != nil { // if no provider, dont check for the tsig (which is a longer check)
         if t := m.IsTsig(); t != nil {
-            data, w.tsigRequestMAC, err = dns.TsigGenerateProvider(m, w.tsigProvider, w.tsigRequestMAC, w.tsigTimersOnly)
+            data, w.tsigRequestMAC, err = dns.TsigGenerateWithProvider(m, w.tsigProvider, w.tsigRequestMAC, w.tsigTimersOnly)
             if err != nil {
                 return err
             }
