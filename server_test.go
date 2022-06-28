@@ -18,15 +18,12 @@ import (
     "github.com/miekg/dns"
 
     "github.com/lucas-clemente/quic-go"
-    // "github.com/lucas-clemente/quic-go/logging"
-    // "github.com/lucas-clemente/quic-go/qlog"
-    // "os"
 )
 
-func RunLocalServer(laddr string, quicConfig *quic.Config, config *tls.Config) (*Server, string, chan error, error) {
+func RunLocalServer(laddr string, quicConfig *quic.Config, config *tls.Config) (*Server, string, error) {
     pc, err := net.ListenPacket("udp", laddr)
     if err != nil {
-        return nil, "", nil, err
+        return nil, "", err
     }
 
     server := &Server{
@@ -39,22 +36,17 @@ func RunLocalServer(laddr string, quicConfig *quic.Config, config *tls.Config) (
         WriteTimeout: time.Minute,
     }
 
-    waitLock := sync.Mutex{}
-    waitLock.Lock()
-    server.NotifyStartedFunc = waitLock.Unlock
-
-    // fin must be buffered so the goroutine below won't block
-    // forever if fin is never read from. This always happens
-    // if the channel is discarded and can happen in TestShutdownUDP.
-    fin := make(chan error, 1)
+    done := make(chan error, 1)
 
     go func() {
-        fin <- server.ActivateAndServe()
+        server.NotifyStartedFunc = func() {
+            done <- nil
+        }
+        done <- server.ActivateAndServe()
         pc.Close()
     }()
 
-    waitLock.Lock()
-    return server, pc.LocalAddr().String(), fin, nil
+    return server, pc.LocalAddr().String(), <-done
 }
 
 func generateTLSConfig() *tls.Config {
@@ -133,13 +125,7 @@ func TestSimpleQuery(t *testing.T) {
     dns.HandleFunc("example.com.", HelloServer)
     defer dns.HandleRemove("example.com.")
 
-    // quicConfig := &quic.Config{
-    //     Tracer: qlog.NewTracer(func(_ logging.Perspective, connID []byte) io.WriteCloser {
-    //         return io.WriteCloser(os.Stdout)
-    //     }),
-    // }
-
-    s, addr, _, err := RunLocalServer(":0", nil, generateTLSConfig())
+    s, addr, err := RunLocalServer(":0", nil, generateTLSConfig())
     if err != nil {
         t.Fatalf("unable to run test server: %v", err)
     }
@@ -170,11 +156,11 @@ func TestSimpleQuery(t *testing.T) {
     }
 }
 
-func TestBlast1OneHundredQueriesOverOneConn(t *testing.T) {
+func TestBlastOneHundredQueriesOverOneConn(t *testing.T) {
     dns.HandleFunc("example.com.", HelloServer)
     defer dns.HandleRemove("example.com.")
 
-    s, addr, _, err := RunLocalServer(":0", nil, generateTLSConfig())
+    s, addr, err := RunLocalServer(":0", nil, generateTLSConfig())
     if err != nil {
         t.Fatalf("unable to run test server: %v", err)
     }
