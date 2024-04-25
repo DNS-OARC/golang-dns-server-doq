@@ -17,7 +17,7 @@ import (
 
     "github.com/miekg/dns"
 
-    "github.com/lucas-clemente/quic-go"
+    "github.com/quic-go/quic-go"
 )
 
 // A Server defines parameters for running an DNS-over-QUIC server.
@@ -29,7 +29,7 @@ type Server struct {
     // QUIC connection configuration.
     QuicConfig *quic.Config
     // QUIC Listener to use, this is to aid in systemd's socket activation.
-    Listener quic.Listener
+    Listener *quic.Listener
     // Packet "Listener" to use, this is to aid in systemd's socket activation.
     PacketConn net.PacketConn
     // TLS connection configuration.
@@ -380,7 +380,7 @@ type connection struct {
     wg      sync.WaitGroup
 }
 
-func (srv *Server) serveQUIC(l quic.Listener) error {
+func (srv *Server) serveQUIC(l *quic.Listener) error {
     defer l.Close()
 
     if srv.NotifyStartedFunc != nil {
@@ -461,7 +461,7 @@ func (srv *Server) serveQUICStream(c *connection, stream quic.Stream) {
         remoteAddr: c.conn.RemoteAddr(),
         tsigSecret: srv.TsigSecret,
 
-        connectionState: c.conn.ConnectionState().TLS.ConnectionState,
+        connectionState: c.conn.ConnectionState().TLS,
     }
     defer w.Close()
     w.writer = w
