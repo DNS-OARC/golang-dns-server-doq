@@ -2,6 +2,15 @@
 
 WIP
 
+In-use at https://cmdns.dev.dns-oarc.net/ instances:
+```
+$ kdig @77.72.225.247 ns.tcmdns.dev.dns-oarc.net AAAA +quic +short
+2a01:3f0:0:57::247
+$ q ns.tcmdns.dev.dns-oarc.net @quic://77.72.225.247 -i
+ns.tcmdns.dev.dns-oarc.net. 1m A 77.72.225.247
+ns.tcmdns.dev.dns-oarc.net. 1m AAAA 2a01:3f0:0:57::247
+```
+
 Protocols TODO:
 - send STREAM FIN after response?
 - check for STREAM FIN from client on query?
@@ -28,5 +37,5 @@ srv.ListenAndServe()
 ```
 MIT License
 
-Copyright (c) 2022 OARC, Inc.
+Copyright (c) 2024 OARC, Inc.
 ```
