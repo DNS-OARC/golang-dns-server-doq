@@ -69,9 +69,13 @@ func (srv *Server) init() {
     if srv.Handler == nil {
         srv.Handler = dns.DefaultServeMux
     }
-    if srv.ReadTimeout == 0 {
-        srv.ReadTimeout = time.Second * 2
+}
+
+func (srv *Server) getReadTimeout() time.Duration {
+    if srv.ReadTimeout != 0 {
+        return srv.ReadTimeout
     }
+    return 2 * time.Second
 }
 
 func unlockOnce(l sync.Locker) func() {
@@ -466,8 +470,10 @@ func (srv *Server) serveQUICStream(c *connection, stream quic.Stream) {
     defer w.Close()
     w.writer = w
 
-    stream.SetReadDeadline(time.Now().Add(srv.ReadTimeout))
-    stream.SetWriteDeadline(time.Now().Add(srv.WriteTimeout))
+    stream.SetReadDeadline(time.Now().Add(srv.getReadTimeout()))
+    if srv.WriteTimeout != 0 {
+        stream.SetWriteDeadline(time.Now().Add(srv.WriteTimeout))
+    }
 
     var length uint16
     if err := binary.Read(stream, binary.BigEndian, &length); err != nil {
