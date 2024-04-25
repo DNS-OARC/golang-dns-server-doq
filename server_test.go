@@ -17,7 +17,7 @@ import (
 
     "github.com/miekg/dns"
 
-    "github.com/lucas-clemente/quic-go"
+    "github.com/quic-go/quic-go"
 )
 
 func RunLocalServer(laddr string, quicConfig *quic.Config, config *tls.Config) (*Server, string, error) {
@@ -80,7 +80,7 @@ func NewClient(addr string) (quic.Connection, error) {
         InsecureSkipVerify: true,
         NextProtos:         []string{"doq"},
     }
-    conn, err := quic.DialAddr(addr, tlsConf, nil)
+    conn, err := quic.DialAddr(context.Background(), addr, tlsConf, nil)
     if err != nil {
         return nil, err
     }
