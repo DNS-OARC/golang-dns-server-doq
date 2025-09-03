@@ -1,4 +1,4 @@
-module github.com/DNS-OARC/golang-dns-server-doq
+module codeberg.org/DNS-OARC/golang-dns-server-doq
 
 go 1.22
 
