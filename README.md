@@ -1,3 +1,5 @@
+# NOTE: Moved to https://codeberg.org/DNS-OARC/golang-dns-server-doq
+
 # DNS-over-QUIC (DoQ, RFC9250) Server
 
 WIP
